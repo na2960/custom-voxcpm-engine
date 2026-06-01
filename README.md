@@ -17,12 +17,4 @@ custom-voxcpm-engine/
 
 ## Usage
 
-1. Convert .wav audio to Mel tensor inputs:
-   ```bash
-   python dataset/prepare_data.py raw_wavs/ prepared_tensors/
-   ```
-
-2. Train the model:
-   ```bash
-   python train_pipeline.py prepared_tensors/ --epochs 10 --batch_size 4
-   ```
+1.
