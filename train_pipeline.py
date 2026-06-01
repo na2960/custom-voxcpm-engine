@@ -6,6 +6,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from voxcpm import VoxCPM
 from peft import LoraConfig, get_peft_model, SafetensorsStorage
+from modules.custom_loss import CustomLoss
 
 # ==========================================
 # 1. HYPERPARAMETERS & CONFIGURATION
@@ -100,6 +101,8 @@ def run_training():
     dataset = VoiceDataset(data_dir=DATA_DIR, sample_rate=base_model.sample_rate)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
 
+    criterion = CustomLoss(l1_weights=1e-5)
+
     model.train()
     print("Beginning fine-tuning iterations...")
     
@@ -115,7 +118,8 @@ def run_training():
             # 2. Execute forward pass through the training graph
             # VoxCPM2 computes internal conditional flow-matching loss natively during training execution
             outputs = model(waveforms=waveforms, texts=texts)
-            loss = outputs.loss / GRADIENT_ACCUMULATION_STEPS
+            # Pass both the output object and the model weights to calculate regularization
+            loss = criterion(outputs, model.named_parameters()) / GRADIENT_ACCUMULATION_STEPS
             
             # 3. Backward pass to calculate gradients
             loss.backward()
