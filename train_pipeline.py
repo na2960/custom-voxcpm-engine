@@ -49,14 +49,13 @@ def train_loop(data_dir, epochs, batch_size, lr, grad_accum, output_dir):
     base_model = voxcpm_wrapper.tts_model
     base_model.to(device=device, dtype=torch.bfloat16)
 
-for param in base_model.parameters():
+    for param in base_model.parameters():
         param.requires_grad = False
 
     # ==========================================
     # MONKEY PATCH: Fix PEFT compatibility with VoxCPM Config
     # ==========================================
     if not hasattr(base_model.config, "get"):
-        # Add a duck-type .get() method directly to the configuration class layout
         type(base_model.config).get = lambda self, key, default=None: getattr(self, key, default)
     # ==========================================
 
