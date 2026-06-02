@@ -1,0 +1,1 @@
+The behavior can be understood as a combination of two parts: a repeating local structure that matches the underlying pattern as a representative unit and a global progression that describes how neighboring units remain coordinated with one another in terms of information, motion, or influence throughout the whole structure. 
