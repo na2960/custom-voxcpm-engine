@@ -9,7 +9,7 @@ from voxcpm import VoxCPM
 from peft import LoraConfig, get_peft_model
 
 class VoiceDataset(Dataset):
-    def __init__(self, data_dir, sample_rate=24000):
+    def __init__(self, data_dir, sample_rate=16000): # AudioVAE encoding expects 16kHz
         self.data_dir = data_dir
         self.sample_rate = sample_rate
         self.samples = []
@@ -45,19 +45,22 @@ def train_loop(data_dir, epochs, batch_size, lr, grad_accum, output_dir):
     print(f"Targeting active device pipeline: {device}")
 
     print("Loading base VoxCPM2 network weights...")
+    # Keep the high-level wrapper intact to access helper modules
     voxcpm_wrapper = VoxCPM.from_pretrained("openbmb/VoxCPM2", load_denoiser=False)
+    
+    tokenizer = voxcpm_wrapper.tokenizer
+    audiovae = voxcpm_wrapper.audiovae
     base_model = voxcpm_wrapper.tts_model
+    
     base_model.to(device=device, dtype=torch.bfloat16)
+    audiovae.to(device=device, dtype=torch.bfloat16)
 
     for param in base_model.parameters():
         param.requires_grad = False
 
-    # ==========================================
-    # MONKEY PATCH: Fix PEFT compatibility with VoxCPM Config
-    # ==========================================
+    # Fix PEFT configuration alignment
     if not hasattr(base_model.config, "get"):
         type(base_model.config).get = lambda self, key, default=None: getattr(self, key, default)
-    # ==========================================
 
     peft_config = LoraConfig(
         r=32, lora_alpha=32,
@@ -69,7 +72,8 @@ def train_loop(data_dir, epochs, batch_size, lr, grad_accum, output_dir):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
-    dataset = VoiceDataset(data_dir=data_dir, sample_rate=base_model.sample_rate)
+    # Note: Dataset forces audio conversion to 16kHz for latent encoding passes
+    dataset = VoiceDataset(data_dir=data_dir, sample_rate=16000)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 
     model.train()
@@ -83,9 +87,21 @@ def train_loop(data_dir, epochs, batch_size, lr, grad_accum, output_dir):
             waveforms = batch["waveforms"].to(device=device, dtype=torch.bfloat16)
             texts = batch["texts"]
             
-            outputs = model(waveforms=waveforms, texts=texts)
-            loss = outputs.loss / grad_accum
+            # 1. Manually tokenize text inputs into standard tensors
+            tokenized = tokenizer(texts, padding=True, return_tensors="pt").to(device)
             
+            # 2. Extract acoustic latents using the frozen AudioVAE model
+            with torch.no_grad():
+                audio_latents = audiovae.encode(waveforms)
+            
+            # 3. Pass explicit expected kwargs directly into the forward loop
+            outputs = model(
+                input_ids=tokenized.input_ids,
+                attention_mask=tokenized.attention_mask,
+                feat=audio_latents
+            )
+            
+            loss = outputs.loss / grad_accum
             loss.backward()
             total_loss += loss.item() * grad_accum
             
@@ -102,7 +118,7 @@ def train_loop(data_dir, epochs, batch_size, lr, grad_accum, output_dir):
         print(f"Successfully saved tracking checkpoint to: {checkpoint_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train custom VoxCPM2 engine via repository scripts.")
+    parser = argparse.ArgumentParser(description="Train custom VoxCPM2 engine.")
     parser.add_argument("data_dir", help="Directory holding the train_manifest.jsonl file")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=2)
