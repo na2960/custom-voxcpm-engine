@@ -1,0 +1,1 @@
+Bloch's theorem describes the allowed persistent behaviors inside a system built from a basic pattern that repeats identically through space. 
