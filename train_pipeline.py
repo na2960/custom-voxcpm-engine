@@ -1,30 +1,13 @@
+# train_pipeline.py
 import os
 import json
+import argparse
 import torch
 import torchaudio
-import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from voxcpm import VoxCPM
-from peft import LoraConfig, get_peft_model, SafetensorsStorage
-from modules.custom_loss import CustomLoss
+from peft import LoraConfig, get_peft_model
 
-# ==========================================
-# 1. HYPERPARAMETERS & CONFIGURATION
-# ==========================================
-BATCH_SIZE = 2                 # Keep low to prevent CUDA OOM on T4 GPUs
-GRADIENT_ACCUMULATION_STEPS = 4 # Simulates a virtual batch size of 8 (2 * 4)
-LEARNING_RATE = 2e-4           # Standard stable learning rate for LoRA tuning
-LORA_RANK = 32                 # Dimensional rank of the injected matrix tensors
-LORA_ALPHA = 32                # Scaling factor for the adapter weights
-EPOCHS = 3                     # Total passes over your custom voice dataset
-DATA_DIR = "./my-voice-dataset"
-OUTPUT_DIR = "./checkpoints"
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# ==========================================
-# 2. CUSTOM PYTORCH DATA LOADER
-# ==========================================
 class VoiceDataset(Dataset):
     def __init__(self, data_dir, sample_rate=24000):
         self.data_dir = data_dir
@@ -42,105 +25,83 @@ class VoiceDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         audio_path = os.path.join(self.data_dir, sample["audio_path"])
-        
-        # Load audio file waveform tensor and match model expected sample rate
         waveform, sr = torchaudio.load(audio_path)
+        
         if sr != self.sample_rate:
             resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=self.sample_rate)
             waveform = resampler(waveform)
             
-        # Standardize shape to 1D sequence tensor [samples]
         waveform = waveform.mean(dim=0) 
-        
-        return {
-            "waveform": waveform,
-            "text": sample["text"]
-        }
+        return {"waveform": waveform, "text": sample["text"]}
 
-# Custom collation function to dynamically pad varying audio/text lengths per batch
 def collate_fn(batch):
     waveforms = [item["waveform"] for item in batch]
     texts = [item["text"] for item in batch]
-    
-    # Pad audio tensors with zero values so they form a uniform matrix shape
     padded_waveforms = torch.nn.utils.rnn.pad_sequence(waveforms, batch_first=True)
     return {"waveforms": padded_waveforms, "texts": texts}
 
-# ==========================================
-# 3. CORE EXECUTABLE TRAINING LOOP
-# ==========================================
-def run_training():
+def train_loop(data_dir, epochs, batch_size, lr, grad_accum, output_dir):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using execution device: {device}")
+    print(f"Targeting active device pipeline: {device}")
 
-    # Initialize Base Model and cast weights to bfloat16 to optimize VRAM
-    print("Loading base VoxCPM2 network tensors...")
+    print("Loading base VoxCPM2 network weights...")
     voxcpm_wrapper = VoxCPM.from_pretrained("openbmb/VoxCPM2", load_denoiser=False)
     base_model = voxcpm_wrapper.tts_model
     base_model.to(device=device, dtype=torch.bfloat16)
 
-    # Freeze all core upstream layers
     for param in base_model.parameters():
         param.requires_grad = False
 
-    # Inject low-rank adapters into the linear layers of the Diffusion Transformer block
     peft_config = LoraConfig(
-        r=LORA_RANK,
-        lora_alpha=LORA_ALPHA,
-        target_modules=["q_proj", "v_proj", "to_q", "to_v"], # LocDiT / TSLM attention projections
-        lora_dropout=0.05,
-        bias="none"
+        r=32, lora_alpha=32,
+        target_modules=["q_proj", "v_proj", "to_q", "to_v"], 
+        lora_dropout=0.05, bias="none"
     )
     model = get_peft_model(base_model, peft_config)
     model.print_trainable_parameters()
 
-    # Initialize the Optimizer (AdamW handles weight decay cleanly for transformers)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
-    # Prepare data streaming pipeline
-    dataset = VoiceDataset(data_dir=DATA_DIR, sample_rate=base_model.sample_rate)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-
-    criterion = CustomLoss(l1_weights=1e-5)
+    dataset = VoiceDataset(data_dir=data_dir, sample_rate=base_model.sample_rate)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 
     model.train()
-    print("Beginning fine-tuning iterations...")
+    print("Launching fine-tuning passes...")
     
-    for epoch in range(EPOCHS):
+    for epoch in range(1, epochs + 1):
         total_loss = 0
         optimizer.zero_grad()
         
         for step, batch in enumerate(dataloader):
-            # 1. Cast input features to execution space
             waveforms = batch["waveforms"].to(device=device, dtype=torch.bfloat16)
             texts = batch["texts"]
             
-            # 2. Execute forward pass through the training graph
-            # VoxCPM2 computes internal conditional flow-matching loss natively during training execution
             outputs = model(waveforms=waveforms, texts=texts)
-            # Pass both the output object and the model weights to calculate regularization
-            loss = criterion(outputs, model.named_parameters()) / GRADIENT_ACCUMULATION_STEPS
+            loss = outputs.loss / grad_accum
             
-            # 3. Backward pass to calculate gradients
             loss.backward()
-            total_loss += loss.item() * GRADIENT_ACCUMULATION_STEPS
+            total_loss += loss.item() * grad_accum
             
-            # 4. Perform optimizer step based on gradient accumulation settings
-            if (step + 1) % GRADIENT_ACCUMULATION_STEPS == 0 or (step + 1) == len(dataloader):
-                # Gradient clipping prevents parameters from exploding during matrix multiplication
+            if (step + 1) % grad_accum == 0 or (step + 1) == len(dataloader):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
                 
-            if step % 5 == 0:
-                print(f"Epoch: {epoch+1}/{EPOCHS} | Step: {step}/{len(dataloader)} | Loss: {loss.item():.4f}")
+            if step % 2 == 0:
+                print(f"Epoch: {epoch}/{epochs} | Step: {step}/{len(dataloader)} | Flow Loss: {loss.item() * grad_accum:.4f}")
         
-        # 5. Checkpointing at the end of every epoch
-        checkpoint_path = os.path.join(OUTPUT_DIR, f"voxcpm2_lora_epoch_{epoch+1}")
+        checkpoint_path = os.path.join(output_dir, f"voxcpm2_lora_epoch_{epoch}")
         model.save_pretrained(checkpoint_path)
-        print(f"Saved trainable adapter weights tensor to: {checkpoint_path}")
-
-    print("Training complete! The optimized .safetensors matrix is ready for podcast generation.")
+        print(f"Successfully saved tracking checkpoint to: {checkpoint_path}")
 
 if __name__ == "__main__":
-    run_training()
+    parser = argparse.ArgumentParser(description="Train custom VoxCPM2 engine via repository scripts.")
+    parser.add_argument("data_dir", help="Directory holding the train_manifest.jsonl file")
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--grad_accum", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--output_dir", default="./checkpoints", help="Path to save adapters")
+    args = parser.parse_args()
+    
+    train_loop(args.data_dir, args.epochs, args.batch_size, args.lr, args.grad_accum, args.output_dir)
