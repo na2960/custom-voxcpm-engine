@@ -7,9 +7,10 @@ import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from voxcpm import VoxCPM
 from peft import LoraConfig, get_peft_model
+from transformers import AutoTokenizer  # ADDED: Explicit Hugging Face import
 
 class VoiceDataset(Dataset):
-    def __init__(self, data_dir, sample_rate=16000): # AudioVAE encoding expects 16kHz
+    def __init__(self, data_dir, sample_rate=16000): 
         self.data_dir = data_dir
         self.sample_rate = sample_rate
         self.samples = []
@@ -45,10 +46,12 @@ def train_loop(data_dir, epochs, batch_size, lr, grad_accum, output_dir):
     print(f"Targeting active device pipeline: {device}")
 
     print("Loading base VoxCPM2 network weights...")
-    # Keep the high-level wrapper intact to access helper modules
     voxcpm_wrapper = VoxCPM.from_pretrained("openbmb/VoxCPM2", load_denoiser=False)
     
-    tokenizer = voxcpm_wrapper.tokenizer
+    # FIX: Initialize the tokenizer explicitly
+    print("Loading explicit text tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained("openbmb/VoxCPM2", trust_remote_code=True)
+    
     audiovae = voxcpm_wrapper.audiovae
     base_model = voxcpm_wrapper.tts_model
     
@@ -58,7 +61,6 @@ def train_loop(data_dir, epochs, batch_size, lr, grad_accum, output_dir):
     for param in base_model.parameters():
         param.requires_grad = False
 
-    # Fix PEFT configuration alignment
     if not hasattr(base_model.config, "get"):
         type(base_model.config).get = lambda self, key, default=None: getattr(self, key, default)
 
@@ -72,7 +74,6 @@ def train_loop(data_dir, epochs, batch_size, lr, grad_accum, output_dir):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
-    # Note: Dataset forces audio conversion to 16kHz for latent encoding passes
     dataset = VoiceDataset(data_dir=data_dir, sample_rate=16000)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 
@@ -87,14 +88,11 @@ def train_loop(data_dir, epochs, batch_size, lr, grad_accum, output_dir):
             waveforms = batch["waveforms"].to(device=device, dtype=torch.bfloat16)
             texts = batch["texts"]
             
-            # 1. Manually tokenize text inputs into standard tensors
             tokenized = tokenizer(texts, padding=True, return_tensors="pt").to(device)
             
-            # 2. Extract acoustic latents using the frozen AudioVAE model
             with torch.no_grad():
                 audio_latents = audiovae.encode(waveforms)
             
-            # 3. Pass explicit expected kwargs directly into the forward loop
             outputs = model(
                 input_ids=tokenized.input_ids,
                 attention_mask=tokenized.attention_mask,
