@@ -2,12 +2,13 @@
 import os
 import json
 import argparse
+import inspect
 import torch
 import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from voxcpm import VoxCPM
 from peft import LoraConfig, get_peft_model
-from transformers import AutoTokenizer  # ADDED: Explicit Hugging Face import
+from transformers import AutoTokenizer
 
 class VoiceDataset(Dataset):
     def __init__(self, data_dir, sample_rate=16000): 
@@ -48,12 +49,31 @@ def train_loop(data_dir, epochs, batch_size, lr, grad_accum, output_dir):
     print("Loading base VoxCPM2 network weights...")
     voxcpm_wrapper = VoxCPM.from_pretrained("openbmb/VoxCPM2", load_denoiser=False)
     
-    # FIX: Initialize the tokenizer explicitly
     print("Loading explicit text tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained("openbmb/VoxCPM2", trust_remote_code=True)
     
-    audiovae = voxcpm_wrapper.audiovae
+    # ==========================================
+    # DYNAMIC ARCHITECTURE INSPECTION
+    # ==========================================
+    print("Scanning internal architecture attributes...")
+    wrapper_attrs = dir(voxcpm_wrapper)
+    
+    if 'vocoder' in wrapper_attrs:
+        audiovae = voxcpm_wrapper.vocoder
+        print(" -> AudioVAE found successfully at: .vocoder")
+    elif 'vae' in wrapper_attrs:
+        audiovae = voxcpm_wrapper.vae
+        print(" -> AudioVAE found successfully at: .vae")
+    else:
+        print("CRITICAL ERROR: Available wrapper attributes:", [a for a in wrapper_attrs if not a.startswith('_')])
+        raise AttributeError("Could not locate the AudioVAE attribute on the VoxCPM wrapper. See available attributes above.")
+
     base_model = voxcpm_wrapper.tts_model
+    
+    print("Analyzing core model forward pass signature...")
+    sig = inspect.signature(base_model.forward)
+    print(f" -> Core model expects these exact arguments: {sig}")
+    # ==========================================
     
     base_model.to(device=device, dtype=torch.bfloat16)
     audiovae.to(device=device, dtype=torch.bfloat16)
@@ -91,8 +111,13 @@ def train_loop(data_dir, epochs, batch_size, lr, grad_accum, output_dir):
             tokenized = tokenizer(texts, padding=True, return_tensors="pt").to(device)
             
             with torch.no_grad():
-                audio_latents = audiovae.encode(waveforms)
+                if hasattr(audiovae, "encode"):
+                    audio_latents = audiovae.encode(waveforms)
+                else:
+                    audio_latents = audiovae(waveforms)
             
+            # Note: If this crashes with a unexpected keyword argument, 
+            # check the signature printout above to see if 'feat' needs to be renamed (e.g. 'audio_features')
             outputs = model(
                 input_ids=tokenized.input_ids,
                 attention_mask=tokenized.attention_mask,
